@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Authentication</title>
+</head>
+<body>
+    <h1>Test Authentication</h1>
+    
+    <div>
+        <h2>Login</h2>
+        <input type="email" id="email" placeholder="Email" value="test@example.com">
+        <input type="password" id="password" placeholder="Password" value="password">
+        <button onclick="testLogin()">Login</button>
+    </div>
+    
+    <div>
+        <h2>Get User</h2>
+        <button onclick="testGetUser()">Get User</button>
+    </div>
+    
+    <div id="result"></div>
+
+    <script>
+        const API_BASE = 'http://localhost:8000/api';
+        let authToken = null;
+
+        async function testLogin() {
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            
+            try {
+                const response = await fetch(`${API_BASE}/auth/login`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+                
+                const data = await response.json();
+                console.log('Login response:', data);
+                
+                if (response.ok) {
+                    authToken = data.token;
+                    document.getElementById('result').innerHTML = `
+                        <h3>Login Success!</h3>
+                        <p>Token: ${authToken}</p>
+                        <p>User: ${data.user.name}</p>
+                    `;
+                } else {
+                    document.getElementById('result').innerHTML = `
+                        <h3>Login Failed</h3>
+                        <p>Error: ${data.error || data.message}</p>
+                    `;
+                }
+            } catch (error) {
+                console.error('Login error:', error);
+                document.getElementById('result').innerHTML = `
+                    <h3>Login Error</h3>
+                    <p>Error: ${error.message}</p>
+                `;
+            }
+        }
+
+        async function testGetUser() {
+            if (!authToken) {
+                document.getElementById('result').innerHTML = '<p>Please login first</p>';
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${API_BASE}/user`, {
+                    method: 'GET',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Accept': 'application/json',
+                        'Authorization': `Bearer ${authToken}`
+                    }
+                });
+                
+                const data = await response.json();
+                console.log('Get user response:', data);
+                
+                if (response.ok) {
+                    document.getElementById('result').innerHTML = `
+                        <h3>Get User Success!</h3>
+                        <pre>${JSON.stringify(data, null, 2)}</pre>
+                    `;
+                } else {
+                    document.getElementById('result').innerHTML = `
+                        <h3>Get User Failed</h3>
+                        <p>Error: ${data.error || data.message}</p>
+                    `;
+                }
+            } catch (error) {
+                console.error('Get user error:', error);
+                document.getElementById('result').innerHTML = `
+                    <h3>Get User Error</h3>
+                    <p>Error: ${error.message}</p>
+                `;
+            }
+        }
+    </script>
+</body>
+</html>
