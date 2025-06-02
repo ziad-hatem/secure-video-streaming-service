@@ -25,6 +25,7 @@ class VideoProcessingService
     ];
 
     protected array $chunkMappings = []; // Store chunk name mappings
+    protected array $encryptionKeys = []; // Store encryption keys for each resolution
 
     public function __construct()
     {
@@ -69,6 +70,80 @@ class VideoProcessingService
     }
 
     /**
+     * Generate encryption key for a resolution
+     */
+    protected function generateEncryptionKey(string $resolution): string
+    {
+        return bin2hex(random_bytes(16)); // 128-bit key
+    }
+
+    /**
+     * Generate initialization vector for encryption
+     */
+    protected function generateIV(): string
+    {
+        return bin2hex(random_bytes(16)); // 128-bit IV
+    }
+
+    /**
+     * Save encryption key to file
+     */
+    protected function saveEncryptionKey(string $outputDir, string $resolution, string $key): string
+    {
+        $keyFileName = $this->generateSecureChunkName('key_') . '.key';
+        $keyFilePath = $outputDir . '/' . $keyFileName;
+
+        // Write the key in binary format
+        file_put_contents($keyFilePath, hex2bin($key));
+        chmod($keyFilePath, 0600); // Restrict file permissions
+
+        return $keyFileName;
+    }
+
+    /**
+     * Create key info file for FFmpeg encryption
+     */
+    protected function createKeyInfoFile(string $outputDir, string $resolution, string $keyFileName, string $key, string $iv): string
+    {
+        $keyInfoFileName = $outputDir . '/keyinfo_' . $resolution . '.txt';
+
+        // Key info file format for FFmpeg:
+        // Line 1: Key URI (how the player will request the key)
+        // Line 2: Path to key file (for FFmpeg to read during encoding)
+        // Line 3: IV in hex format
+        // Use relative URL for key endpoint (works with any port/domain)
+        $keyUri = '/api/hls/key/' . $keyFileName;
+        $keyFilePath = $outputDir . '/' . $keyFileName;
+
+        $keyInfoContent = $keyUri . "\n" . $keyFilePath . "\n" . $iv;
+        file_put_contents($keyInfoFileName, $keyInfoContent);
+
+        return $keyInfoFileName;
+    }
+
+    /**
+     * Clean up temporary files after processing
+     */
+    protected function cleanupTempFiles(string $outputDir): void
+    {
+        // Remove key info files
+        $keyInfoFiles = glob($outputDir . '/keyinfo_*.txt');
+        foreach ($keyInfoFiles as $file) {
+            if (file_exists($file)) {
+                unlink($file);
+            }
+        }
+
+        // Remove any remaining temporary segment files
+        $tempFiles = glob($outputDir . '/temp_*.ts');
+        foreach ($tempFiles as $file) {
+            if (file_exists($file)) {
+                unlink($file);
+            }
+        }
+    }
+
+    /**
      * Generate chunk mapping for a resolution
      */
     protected function generateChunkMapping(string $resolution, int $segmentCount): array
@@ -83,14 +158,21 @@ class VideoProcessingService
     }
 
     /**
-     * Save chunk mappings to a secure file
+     * Save chunk mappings and encryption keys to secure files
      */
     protected function saveChunkMappings(string $outputDir, array $mappings): void
     {
+        // Save chunk mappings
         $mappingFile = $outputDir . '/.chunk_map.json';
         $encryptedMappings = base64_encode(json_encode($mappings));
         file_put_contents($mappingFile, $encryptedMappings);
         chmod($mappingFile, 0600); // Restrict file permissions
+
+        // Save encryption keys mapping
+        $encryptionFile = $outputDir . '/.encryption_map.json';
+        $encryptedKeys = base64_encode(json_encode($this->encryptionKeys));
+        file_put_contents($encryptionFile, $encryptedKeys);
+        chmod($encryptionFile, 0600); // Restrict file permissions
     }
 
     /**
@@ -150,8 +232,11 @@ class VideoProcessingService
             // Create master playlist
             $masterPlaylist = $this->createMasterPlaylist($hlsFiles, $outputDir);
 
-            // Save chunk mappings for security
+            // Save chunk mappings and encryption keys for security
             $this->saveChunkMappings($outputDir, $this->chunkMappings);
+
+            // Clean up temporary key info files
+            $this->cleanupTempFiles($outputDir);
 
             $video->update([
                 'status' => 'completed',
@@ -226,12 +311,24 @@ class VideoProcessingService
     }
 
     /**
-     * Transcode audio-only stream to HLS
+     * Transcode audio-only stream to HLS with encryption
      */
     protected function transcodeAudioToHLS(string $inputPath, string $outputDir, string $audioTrack, array $config): ?string
     {
         $outputFile = $outputDir . '/' . $audioTrack . '.m3u8';
         $tempSegmentPattern = $outputDir . '/temp_' . $audioTrack . '_%03d.ts';
+
+        // Generate encryption key and IV
+        $encryptionKey = $this->generateEncryptionKey($audioTrack);
+        $iv = $this->generateIV();
+        $keyFileName = $this->saveEncryptionKey($outputDir, $audioTrack, $encryptionKey);
+
+        // Store encryption info for later use
+        $this->encryptionKeys[$audioTrack] = [
+            'key' => $encryptionKey,
+            'iv' => $iv,
+            'key_file' => $keyFileName
+        ];
 
         $command = [
             $this->ffmpegPath,
@@ -242,6 +339,8 @@ class VideoProcessingService
             '-hls_time', '10',
             '-hls_list_size', '0',
             '-hls_segment_filename', $tempSegmentPattern,
+            // Encryption parameters
+            '-hls_key_info_file', $this->createKeyInfoFile($outputDir, $audioTrack, $keyFileName, $encryptionKey, $iv),
             '-y',
             $outputFile
         ];
@@ -263,12 +362,24 @@ class VideoProcessingService
     }
 
     /**
-     * Transcode video-only stream to HLS
+     * Transcode video-only stream to HLS with encryption
      */
     protected function transcodeVideoToHLS(string $inputPath, string $outputDir, string $resolution, array $config): ?string
     {
         $outputFile = $outputDir . '/' . $resolution . '.m3u8';
         $tempSegmentPattern = $outputDir . '/temp_' . $resolution . '_%03d.ts';
+
+        // Generate encryption key and IV
+        $encryptionKey = $this->generateEncryptionKey($resolution);
+        $iv = $this->generateIV();
+        $keyFileName = $this->saveEncryptionKey($outputDir, $resolution, $encryptionKey);
+
+        // Store encryption info for later use
+        $this->encryptionKeys[$resolution] = [
+            'key' => $encryptionKey,
+            'iv' => $iv,
+            'key_file' => $keyFileName
+        ];
 
         $command = [
             $this->ffmpegPath,
@@ -280,6 +391,8 @@ class VideoProcessingService
             '-hls_time', '10',
             '-hls_list_size', '0',
             '-hls_segment_filename', $tempSegmentPattern,
+            // Encryption parameters
+            '-hls_key_info_file', $this->createKeyInfoFile($outputDir, $resolution, $keyFileName, $encryptionKey, $iv),
             '-y',
             $outputFile
         ];

@@ -91,6 +91,10 @@ Route::middleware('api.key')->prefix('v1')->group(function () {
     });
 });
 
+// HLS encryption key serving routes (must come BEFORE general hls/{path} route)
+Route::get('hls/key/{keyFileName}', [App\Http\Controllers\HLSKeyController::class, 'getKey'])
+    ->where('keyFileName', '.*\.key');
+
 // HLS streaming routes with CORS headers and security
 Route::get('hls/{path}', function ($path) {
     $filePath = storage_path('app/public/videos/hls/' . $path);
