@@ -144,14 +144,16 @@ class VideoProcessingService
     }
 
     /**
-     * Generate chunk mapping for a resolution
+     * Generate chunk mapping for a resolution or audio track
      */
-    protected function generateChunkMapping(string $resolution, int $segmentCount): array
+    protected function generateChunkMapping(string $trackName, int $segmentCount, string $type = 'video'): array
     {
         $mapping = [];
+        $prefix = $type === 'audio' ? 'aud_' : 'seg_';
+
         for ($i = 0; $i < $segmentCount; $i++) {
-            $originalName = sprintf('%s_%03d.ts', $resolution, $i);
-            $secureName = $this->generateSecureChunkName('seg_') . '.ts';
+            $originalName = sprintf('temp_%s_%03d.ts', $trackName, $i);
+            $secureName = $this->generateSecureChunkName($prefix) . '.ts';
             $mapping[$originalName] = $secureName;
         }
         return $mapping;
@@ -457,9 +459,9 @@ class VideoProcessingService
     /**
      * Rename segments to secure names and update playlist
      */
-    protected function secureSegmentNames(string $outputDir, string $resolution): void
+    protected function secureSegmentNames(string $outputDir, string $trackName): void
     {
-        $playlistFile = $outputDir . '/' . $resolution . '.m3u8';
+        $playlistFile = $outputDir . '/' . $trackName . '.m3u8';
 
         if (!file_exists($playlistFile)) {
             return;
@@ -468,28 +470,30 @@ class VideoProcessingService
         // Read the original playlist
         $playlistContent = file_get_contents($playlistFile);
 
-        // Find all temporary segment files
-        $tempPattern = $outputDir . '/temp_' . $resolution . '_*.ts';
+        // Find all temporary segment files for this track
+        $tempPattern = $outputDir . '/temp_' . $trackName . '_*.ts';
         $tempFiles = glob($tempPattern);
 
         if (empty($tempFiles)) {
             return;
         }
 
+        // Determine if this is an audio or video track
+        $isAudioTrack = array_key_exists($trackName, $this->audioTracks);
+        $trackType = $isAudioTrack ? 'audio' : 'video';
+
         // Generate secure mappings
         $segmentCount = count($tempFiles);
-        $mapping = $this->generateChunkMapping($resolution, $segmentCount);
+        $mapping = $this->generateChunkMapping($trackName, $segmentCount, $trackType);
 
         // Rename files and update playlist
         $updatedPlaylist = $playlistContent;
 
         foreach ($tempFiles as $tempFile) {
             $tempBasename = basename($tempFile);
-            $segmentIndex = (int) preg_replace('/temp_' . $resolution . '_(\d+)\.ts/', '$1', $tempBasename);
-            $originalName = sprintf('%s_%03d.ts', $resolution, $segmentIndex);
 
-            if (isset($mapping[$originalName])) {
-                $secureName = $mapping[$originalName];
+            if (isset($mapping[$tempBasename])) {
+                $secureName = $mapping[$tempBasename];
                 $secureFile = $outputDir . '/' . $secureName;
 
                 // Rename the file
@@ -503,16 +507,16 @@ class VideoProcessingService
         // Save updated playlist
         file_put_contents($playlistFile, $updatedPlaylist);
 
-        // Store mapping for this resolution
-        $this->chunkMappings[$resolution] = $mapping;
+        // Store mapping for this track
+        $this->chunkMappings[$trackName] = $mapping;
 
         // Clean up any remaining temporary files
-        $remainingTempFiles = glob($outputDir . '/temp_' . $resolution . '_*.ts');
+        $remainingTempFiles = glob($outputDir . '/temp_' . $trackName . '_*.ts');
         foreach ($remainingTempFiles as $tempFile) {
             unlink($tempFile);
         }
 
-        Log::info("Secured {$segmentCount} segments for {$resolution}");
+        Log::info("Secured {$segmentCount} segments for {$trackName} ({$trackType})");
     }
 
     protected function createMasterPlaylist(array $hlsFiles, string $outputDir): string
