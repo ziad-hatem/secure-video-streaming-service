@@ -8,16 +8,16 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Route;
 
 // Public routes (no authentication required)
-Route::prefix('auth')->group(function () {
+Route::prefix('auth')->middleware('disable.csrf')->group(function () {
     Route::post('/register', [AuthController::class, 'register']);
     Route::post('/login', [AuthController::class, 'login']);
 });
 
-Route::get('/subscription/plans', [SubscriptionController::class, 'plans']);
+Route::get('/subscription/plans', [SubscriptionController::class, 'plans'])->middleware('disable.csrf');
 
-// Routes that require API key authentication (for web dashboard)
-Route::middleware('api.key')->group(function () {
-    // Auth routes (these will use API keys instead of sessions)
+// Routes for web dashboard (using Sanctum Bearer token authentication)
+Route::middleware(['auth:sanctum', 'disable.csrf'])->group(function () {
+    // Auth routes for web dashboard
     Route::post('/auth/logout', [AuthController::class, 'logout']);
     Route::get('/user', [AuthController::class, 'user']);
     Route::put('/user', [AuthController::class, 'updateProfile']);
@@ -41,9 +41,11 @@ Route::middleware('api.key')->group(function () {
         Route::put('/change-plan', [SubscriptionController::class, 'changePlan']);
         Route::post('/cancel', [SubscriptionController::class, 'cancel']);
         Route::get('/usage', [SubscriptionController::class, 'usage']);
+        Route::post('/checkout-success', [SubscriptionController::class, 'handleCheckoutSuccess']);
+        Route::get('/stripe-config', [SubscriptionController::class, 'getStripeConfig']);
     });
 
-    // Video Management (for web dashboard) - using API key auth
+    // Video Management (for web dashboard) - using Sanctum auth
     Route::prefix('dashboard/videos')->group(function () {
         Route::get('/', [VideoController::class, 'dashboardIndex']);
         Route::post('/upload', [VideoController::class, 'dashboardUpload']);
@@ -53,7 +55,7 @@ Route::middleware('api.key')->group(function () {
 });
 
 // API routes that require API key authentication
-Route::middleware('api.key')->prefix('v1')->group(function () {
+Route::middleware(['api.key', 'disable.csrf'])->prefix('v1')->group(function () {
     // Video routes with API key authentication
     Route::prefix('videos')->group(function () {
         Route::get('/', [VideoController::class, 'index'])->middleware('api.key:videos.read');
@@ -93,39 +95,20 @@ Route::middleware('api.key')->prefix('v1')->group(function () {
 
 // HLS encryption key serving routes (must come BEFORE general hls/{path} route)
 Route::get('hls/key/{keyFileName}', [App\Http\Controllers\HLSKeyController::class, 'getKey'])
-    ->where('keyFileName', '.*\.key');
+    ->where('keyFileName', '.*\.key')
+    ->middleware('disable.csrf');
 
 // HLS streaming routes with CORS headers and security
-Route::get('hls/{path}', function ($path) {
-    $filePath = storage_path('app/public/videos/hls/' . $path);
-
-    if (!file_exists($filePath)) {
-        abort(404);
-    }
-
-    $mimeType = 'application/vnd.apple.mpegurl';
-    if (pathinfo($filePath, PATHINFO_EXTENSION) === 'ts') {
-        $mimeType = 'video/mp2t';
-    }
-
-    return response()->file($filePath, [
-        'Content-Type' => $mimeType,
-        'Access-Control-Allow-Origin' => '*',
-        'Access-Control-Allow-Methods' => 'GET, OPTIONS',
-        'Access-Control-Allow-Headers' => 'Content-Type, Authorization',
-    ]);
-})->where('path', '.*')->middleware('secure.chunk');
+Route::get('hls/{path}', [App\Http\Controllers\HLSController::class, 'serve'])
+    ->where('path', '.*')
+    ->middleware(['secure.chunk', 'disable.csrf']);
 
 // OPTIONS route for HLS files
-Route::options('hls/{path}', function () {
-    return response('', 200, [
-        'Access-Control-Allow-Origin' => '*',
-        'Access-Control-Allow-Methods' => 'GET, OPTIONS',
-        'Access-Control-Allow-Headers' => 'Content-Type, Authorization',
-    ]);
-})->where('path', '.*');
+Route::options('hls/{path}', [App\Http\Controllers\HLSController::class, 'options'])
+    ->where('path', '.*')
+    ->middleware('disable.csrf');
 
 // CORS preflight
 Route::options('{any}', function () {
     return response('', 200);
-})->where('any', '.*');
+})->where('any', '.*')->middleware('disable.csrf');

@@ -19,8 +19,16 @@ class VideoController extends Controller
         // Get the authenticated user (either from Sanctum or API key)
         $user = $request->user();
 
-        // If user is authenticated, show only their videos
+        // If user is authenticated, check subscription limits
         if ($user) {
+            // Check if user has an active subscription or is on trial
+            if (!$user->isOnTrial() && !$user->hasActiveSubscription()) {
+                return response()->json([
+                    'error' => 'No active subscription',
+                    'message' => 'Please subscribe to a plan to access videos'
+                ], 402); // Payment Required
+            }
+
             $videos = Video::where('user_id', $user->id)
                 ->with('user')
                 ->orderBy('created_at', 'desc')
@@ -37,22 +45,70 @@ class VideoController extends Controller
 
     public function show(Video $video): JsonResponse
     {
+        // Check subscription limits for authenticated users
+        $user = request()->user();
+        if ($user) {
+            // Check if user has an active subscription or is on trial
+            if (!$user->isOnTrial() && !$user->hasActiveSubscription()) {
+                return response()->json([
+                    'error' => 'No active subscription',
+                    'message' => 'Please subscribe to a plan to access video details'
+                ], 402); // Payment Required
+            }
+        }
+
         $video->load('user');
         return response()->json($video);
     }
 
     public function upload(Request $request): JsonResponse
     {
+        // Check if the request has a file
+        if (!$request->hasFile('video')) {
+            return response()->json([
+                'error' => 'No file uploaded',
+                'message' => 'Please select a video file to upload'
+            ], 422);
+        }
+
+        // Check for upload errors
+        $file = $request->file('video');
+        if ($file->getError() !== UPLOAD_ERR_OK) {
+            $errorMessages = [
+                UPLOAD_ERR_INI_SIZE => 'The uploaded file exceeds the upload_max_filesize directive in php.ini',
+                UPLOAD_ERR_FORM_SIZE => 'The uploaded file exceeds the MAX_FILE_SIZE directive',
+                UPLOAD_ERR_PARTIAL => 'The uploaded file was only partially uploaded',
+                UPLOAD_ERR_NO_FILE => 'No file was uploaded',
+                UPLOAD_ERR_NO_TMP_DIR => 'Missing a temporary folder',
+                UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk',
+                UPLOAD_ERR_EXTENSION => 'A PHP extension stopped the file upload',
+            ];
+
+            $errorMessage = $errorMessages[$file->getError()] ?? 'Unknown upload error';
+
+            return response()->json([
+                'error' => 'Upload failed',
+                'message' => $errorMessage,
+                'php_limits' => [
+                    'upload_max_filesize' => ini_get('upload_max_filesize'),
+                    'post_max_size' => ini_get('post_max_size'),
+                    'max_execution_time' => ini_get('max_execution_time'),
+                ]
+            ], 422);
+        }
+
         $validator = Validator::make($request->all(), [
             'title' => 'required|string|max:255',
             'description' => 'nullable|string',
-            'video' => 'required|file|mimes:mp4,avi,mov,wmv,flv|max:1048576', // 1GB max
+            'video' => 'required|file|mimes:mp4,avi,mov,wmv,flv|max:1048576', // 1GB max (1024*1024 KB)
         ]);
 
         if ($validator->fails()) {
             return response()->json([
                 'error' => 'Validation failed',
-                'messages' => $validator->errors()
+                'messages' => $validator->errors(),
+                'file_size_mb' => round($file->getSize() / (1024 * 1024), 2),
+                'max_allowed_mb' => 1024
             ], 422);
         }
 
@@ -143,19 +199,49 @@ class VideoController extends Controller
             ], 400);
         }
 
-        // Log additional usage for video streaming (track video file size as data transfer)
-        $apiKey = request()->attributes->get('api_key');
-        if ($apiKey && $video->file_size) {
-            \App\Models\ApiUsage::logUsage(
-                $apiKey->id,
-                'v1/videos/' . $video->id . '/stream-data',
-                'STREAM',
-                request()->ip(),
-                request()->userAgent(),
-                200,
-                0, // No additional response time for metadata
-                $video->file_size // Track the actual video file size as data transfer
-            );
+        // Check subscription limits before allowing video streaming
+        $user = request()->user();
+        if ($user) {
+            // Check if user has exceeded video streaming limits
+            if ($user->hasExceededUsageLimit('video_streams_per_month')) {
+                return response()->json([
+                    'error' => 'Video streaming limit exceeded',
+                    'message' => 'You have exceeded your monthly video streaming limit. Please upgrade your plan or wait for the next billing cycle.'
+                ], 429); // Too Many Requests
+            }
+
+            // Check if user has exceeded data transfer limits
+            if ($user->hasExceededUsageLimit('data_transfer_gb')) {
+                return response()->json([
+                    'error' => 'Data transfer limit exceeded',
+                    'message' => 'You have exceeded your monthly data transfer limit. Please upgrade your plan or wait for the next billing cycle.'
+                ], 429); // Too Many Requests
+            }
+
+            // Check if adding this video's file size would exceed data transfer limit
+            $subscription = $user->activeSubscription;
+            if ($subscription && $video->file_size) {
+                $currentDataTransfer = $subscription->getCurrentUsage('data_transfer_gb');
+                $videoSizeGB = $video->file_size / (1024 * 1024 * 1024); // Convert bytes to GB
+                $dataTransferLimit = $subscription->plan->getLimit('data_transfer_gb');
+
+                if ($dataTransferLimit && ($currentDataTransfer + $videoSizeGB) > $dataTransferLimit) {
+                    return response()->json([
+                        'error' => 'Data transfer limit would be exceeded',
+                        'message' => 'Streaming this video would exceed your monthly data transfer limit. Please upgrade your plan.'
+                    ], 429); // Too Many Requests
+                }
+            }
+        }
+
+        // Increment usage counters for video streaming (but not data transfer - that's tracked per chunk)
+        if ($user) {
+            // Reload the user with active subscription to ensure it's available
+            $user->load('activeSubscription');
+
+            if ($user->activeSubscription) {
+                $user->activeSubscription->incrementUsage('video_streams_per_month');
+            }
         }
 
         return response()->json([

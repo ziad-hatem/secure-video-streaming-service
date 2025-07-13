@@ -60,29 +60,32 @@ class ApiUsage extends Model
      */
     public static function getUsageStats(int $apiKeyId, string $period = 'month'): array
     {
-        $query = self::where('api_key_id', $apiKeyId);
+        // Create base query with API key filter
+        $baseQuery = self::where('api_key_id', $apiKeyId);
 
+        // Apply time period filter
         switch ($period) {
             case 'day':
-                $query->where('created_at', '>=', now()->startOfDay());
+                $baseQuery->where('created_at', '>=', now()->startOfDay());
                 break;
             case 'week':
-                $query->where('created_at', '>=', now()->startOfWeek());
+                $baseQuery->where('created_at', '>=', now()->startOfWeek());
                 break;
             case 'month':
-                $query->where('created_at', '>=', now()->startOfMonth());
+                $baseQuery->where('created_at', '>=', now()->startOfMonth());
                 break;
             case 'year':
-                $query->where('created_at', '>=', now()->startOfYear());
+                $baseQuery->where('created_at', '>=', now()->startOfYear());
                 break;
         }
 
+        // Clone the base query for each statistic to avoid query pollution
         return [
-            'total_requests' => $query->count(),
-            'successful_requests' => $query->where('response_status', '<', 400)->count(),
-            'failed_requests' => $query->where('response_status', '>=', 400)->count(),
-            'total_bytes' => $query->sum('bytes_transferred') ?? 0,
-            'avg_response_time' => $query->avg('response_time_ms') ?? 0,
+            'total_requests' => (int) ((clone $baseQuery)->count()),
+            'successful_requests' => (int) ((clone $baseQuery)->where('response_status', '<', 400)->count()),
+            'failed_requests' => (int) ((clone $baseQuery)->where('response_status', '>=', 400)->count()),
+            'total_bytes' => (int) ((clone $baseQuery)->sum('bytes_transferred') ?? 0),
+            'avg_response_time' => (float) ((clone $baseQuery)->avg('response_time_ms') ?? 0),
         ];
     }
 }

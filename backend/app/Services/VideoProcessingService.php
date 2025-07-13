@@ -13,29 +13,74 @@ class VideoProcessingService
     protected string $ffmpegPath = '/opt/homebrew/bin/ffmpeg';
     protected string $ffprobePath = '/opt/homebrew/bin/ffprobe';
 
-    protected array $resolutions = [
-        '360p' => ['width' => 640, 'height' => 360, 'bitrate' => '800k'],
-        '720p' => ['width' => 1280, 'height' => 720, 'bitrate' => '2500k'],
-        '1080p' => ['width' => 1920, 'height' => 1080, 'bitrate' => '5000k'],
-    ];
+    // Configuration loaded from config/video.php
+    protected array $resolutions;
+    protected array $audioTracks;
+    protected array $performanceSettings;
 
-    protected array $audioTracks = [
-        'audio_128k' => ['bitrate' => '128k', 'codec' => 'aac'],
-        'audio_64k' => ['bitrate' => '64k', 'codec' => 'aac'],
-    ];
+    // Hardware acceleration detection
+    protected ?string $hwAccel = null;
 
     protected array $chunkMappings = []; // Store chunk name mappings
     protected array $encryptionKeys = []; // Store encryption keys for each resolution
 
     public function __construct()
     {
+        $this->chunkMappings = [];
+        $this->encryptionKeys = [];
+
+        // Load configuration
+        $this->loadConfiguration();
+
         // Try to detect FFmpeg paths automatically
         $this->detectFFmpegPaths();
+
+        // Detect hardware acceleration
+        $this->detectHardwareAcceleration();
+    }
+
+    /**
+     * Load configuration from config/video.php
+     */
+    protected function loadConfiguration(): void
+    {
+        $this->resolutions = config('video.resolutions', [
+            '360p' => ['width' => 640, 'height' => 360, 'bitrate' => '600k'],
+            '720p' => ['width' => 1280, 'height' => 720, 'bitrate' => '1800k'],
+            '1080p' => ['width' => 1920, 'height' => 1080, 'bitrate' => '3500k'],
+        ]);
+
+        $this->audioTracks = config('video.audio', [
+            'audio_128k' => ['bitrate' => '128k', 'codec' => 'aac'],
+            'audio_64k' => ['bitrate' => '64k', 'codec' => 'aac'],
+        ]);
+
+        $this->performanceSettings = config('video.performance', [
+            'preset' => 'ultrafast',
+            'tune' => 'zerolatency',
+            'threads' => 0,
+            'crf' => 28,
+            'segment_time' => 6,
+            'parallel_jobs' => 3,
+        ]);
     }
 
     protected function detectFFmpegPaths(): void
     {
-        // Common paths for different systems
+        // Use configured paths if available
+        $configuredFFmpeg = config('video.paths.ffmpeg');
+        $configuredFFprobe = config('video.paths.ffprobe');
+
+        if ($configuredFFmpeg && $this->commandExists($configuredFFmpeg)) {
+            $this->ffmpegPath = $configuredFFmpeg;
+        }
+
+        if ($configuredFFprobe && $this->commandExists($configuredFFprobe)) {
+            $this->ffprobePath = $configuredFFprobe;
+            return;
+        }
+
+        // Auto-detect if not configured
         $possiblePaths = [
             '/opt/homebrew/bin/ffmpeg',  // macOS Homebrew (Apple Silicon)
             '/usr/local/bin/ffmpeg',     // macOS Homebrew (Intel)
@@ -57,6 +102,81 @@ class VideoProcessingService
         $process = new Process(['which', $command]);
         $process->run();
         return $process->isSuccessful();
+    }
+
+    /**
+     * Detect available hardware acceleration
+     */
+    protected function detectHardwareAcceleration(): void
+    {
+        // Check for NVIDIA GPU (NVENC)
+        if ($this->checkHardwareEncoder('h264_nvenc')) {
+            $this->hwAccel = 'nvenc';
+            Log::info('Hardware acceleration: NVIDIA NVENC detected');
+            return;
+        }
+
+        // Check for macOS VideoToolbox
+        if ($this->checkHardwareEncoder('h264_videotoolbox')) {
+            $this->hwAccel = 'videotoolbox';
+            Log::info('Hardware acceleration: VideoToolbox detected');
+            return;
+        }
+
+        // Check for Intel Quick Sync
+        if ($this->checkHardwareEncoder('h264_qsv')) {
+            $this->hwAccel = 'qsv';
+            Log::info('Hardware acceleration: Intel Quick Sync detected');
+            return;
+        }
+
+        Log::info('Hardware acceleration: Using software encoding (CPU only)');
+    }
+
+    /**
+     * Check if a hardware encoder is available
+     */
+    protected function checkHardwareEncoder(string $encoder): bool
+    {
+        $command = [$this->ffmpegPath, '-hide_banner', '-encoders'];
+        $process = new Process($command);
+        $process->run();
+
+        if ($process->isSuccessful()) {
+            return str_contains($process->getOutput(), $encoder);
+        }
+
+        return false;
+    }
+
+    /**
+     * Get optimized encoding parameters based on hardware acceleration
+     */
+    protected function getOptimizedEncodingParams(): array
+    {
+        $params = [
+            '-preset', $this->performanceSettings['preset'],
+            '-tune', $this->performanceSettings['tune'],
+            '-threads', (string) $this->performanceSettings['threads'],
+            '-crf', (string) $this->performanceSettings['crf'],
+        ];
+
+        // Add hardware acceleration if available
+        switch ($this->hwAccel) {
+            case 'nvenc':
+                $params = array_merge(['-c:v', 'h264_nvenc', '-preset', 'fast'], $params);
+                break;
+            case 'videotoolbox':
+                $params = array_merge(['-c:v', 'h264_videotoolbox', '-realtime', '1'], $params);
+                break;
+            case 'qsv':
+                $params = array_merge(['-c:v', 'h264_qsv', '-preset', 'fast'], $params);
+                break;
+            default:
+                $params = array_merge(['-c:v', 'libx264'], $params);
+        }
+
+        return $params;
     }
 
     /**
@@ -198,7 +318,7 @@ class VideoProcessingService
 
             $originalPath = storage_path('app/public/' . $video->original_path);
             $outputDir = storage_path('app/public/videos/hls/' . $video->id);
-            
+
             // Create output directory
             if (!file_exists($outputDir)) {
                 mkdir($outputDir, 0755, true);
@@ -208,28 +328,18 @@ class VideoProcessingService
             $videoInfo = $this->getVideoInfo($originalPath);
             $video->update(['duration' => $videoInfo['duration']]);
 
-            // Generate thumbnail
+            Log::info("🚀 Starting optimized video processing", [
+                'video_id' => $video->id,
+                'duration' => $videoInfo['duration'],
+                'hw_accel' => $this->hwAccel ?? 'software',
+                'parallel_jobs' => $this->performanceSettings['parallel_jobs']
+            ]);
+
+            // Generate thumbnail quickly
             $this->generateThumbnail($originalPath, $video);
 
-            // Process audio tracks first
-            $audioFiles = [];
-            foreach ($this->audioTracks as $name => $config) {
-                $audioFile = $this->transcodeAudioToHLS($originalPath, $outputDir, $name, $config);
-                if ($audioFile) {
-                    $audioFiles[$name] = $audioFile;
-                }
-            }
-
-            // Process video tracks (video only, no audio)
-            $videoFiles = [];
-            foreach ($this->resolutions as $name => $config) {
-                $videoFile = $this->transcodeVideoToHLS($originalPath, $outputDir, $name, $config);
-                if ($videoFile) {
-                    $videoFiles[$name] = $videoFile;
-                }
-            }
-
-            $hlsFiles = array_merge($audioFiles, $videoFiles);
+            // Process tracks in parallel for better performance
+            $hlsFiles = $this->processTracksInParallel($originalPath, $outputDir);
 
             // Create master playlist
             $masterPlaylist = $this->createMasterPlaylist($hlsFiles, $outputDir);
@@ -247,6 +357,11 @@ class VideoProcessingService
                 'processed_at' => now(),
             ]);
 
+            Log::info("✅ Video processing completed successfully", [
+                'video_id' => $video->id,
+                'tracks_processed' => count($hlsFiles)
+            ]);
+
             Log::info("Video processing completed for video ID: {$video->id}");
 
         } catch (\Exception $e) {
@@ -260,6 +375,163 @@ class VideoProcessingService
             ]);
             throw $e; // Re-throw to let the caller handle it
         }
+    }
+
+    /**
+     * Process audio and video tracks in parallel for better performance
+     */
+    protected function processTracksInParallel(string $inputPath, string $outputDir): array
+    {
+        $processes = [];
+        $hlsFiles = [];
+
+        // Start audio processing (lightweight, process first)
+        foreach ($this->audioTracks as $name => $config) {
+            $processes[] = [
+                'type' => 'audio',
+                'name' => $name,
+                'config' => $config,
+                'process' => $this->startAudioTranscoding($inputPath, $outputDir, $name, $config)
+            ];
+        }
+
+        // Start video processing with limited parallelism to avoid overwhelming the system
+        $videoProcesses = 0;
+        foreach ($this->resolutions as $name => $config) {
+            if ($videoProcesses < $this->performanceSettings['parallel_jobs']) {
+                $processes[] = [
+                    'type' => 'video',
+                    'name' => $name,
+                    'config' => $config,
+                    'process' => $this->startVideoTranscoding($inputPath, $outputDir, $name, $config)
+                ];
+                $videoProcesses++;
+            }
+        }
+
+        // Wait for processes to complete and collect results
+        foreach ($processes as $processInfo) {
+            $process = $processInfo['process'];
+
+            if ($process && $process->isRunning()) {
+                $process->wait(); // Wait for completion
+            }
+
+            if ($process && $process->isSuccessful()) {
+                $this->secureSegmentNames($outputDir, $processInfo['name']);
+                $hlsFiles[$processInfo['name']] = $processInfo['name'] . '.m3u8';
+
+                Log::info("✅ {$processInfo['type']} track completed: {$processInfo['name']}");
+            } else {
+                Log::error("❌ Failed to process {$processInfo['type']} track: {$processInfo['name']}", [
+                    'error' => $process ? $process->getErrorOutput() : 'Process failed to start'
+                ]);
+            }
+        }
+
+        // Process remaining video resolutions if we had more than parallel limit
+        $processedVideo = array_filter($processes, fn($p) => $p['type'] === 'video');
+        $remainingVideo = array_diff_key($this->resolutions, array_column($processedVideo, 'name', 'name'));
+
+        foreach ($remainingVideo as $name => $config) {
+            $videoFile = $this->transcodeVideoToHLS($inputPath, $outputDir, $name, $config);
+            if ($videoFile) {
+                $hlsFiles[$name] = $videoFile;
+            }
+        }
+
+        return $hlsFiles;
+    }
+
+    /**
+     * Start audio transcoding process (non-blocking)
+     */
+    protected function startAudioTranscoding(string $inputPath, string $outputDir, string $audioTrack, array $config): ?Process
+    {
+        $outputFile = $outputDir . '/' . $audioTrack . '.m3u8';
+        $tempSegmentPattern = $outputDir . '/temp_' . $audioTrack . '_%03d.ts';
+
+        // Generate encryption key and IV
+        $encryptionKey = $this->generateEncryptionKey($audioTrack);
+        $iv = $this->generateIV();
+        $keyFileName = $this->saveEncryptionKey($outputDir, $audioTrack, $encryptionKey);
+
+        // Store encryption info for later use
+        $this->encryptionKeys[$audioTrack] = [
+            'key' => $encryptionKey,
+            'iv' => $iv,
+            'key_file' => $keyFileName
+        ];
+
+        $command = [
+            $this->ffmpegPath,
+            '-i', $inputPath,
+            '-vn', // No video
+            '-c:a', $config['codec'],
+            '-b:a', $config['bitrate'],
+            '-threads', (string) $this->performanceSettings['threads'],
+            '-hls_time', (string) $this->performanceSettings['segment_time'],
+            '-hls_list_size', '0',
+            '-hls_segment_filename', $tempSegmentPattern,
+            // Encryption parameters
+            '-hls_key_info_file', $this->createKeyInfoFile($outputDir, $audioTrack, $keyFileName, $encryptionKey, $iv),
+            '-y',
+            $outputFile
+        ];
+
+        $process = new Process($command);
+        $process->setTimeout(config('video.timeouts.process_timeout', 7200));
+        $process->start(); // Start asynchronously
+
+        Log::info("🎵 Started audio transcoding: {$audioTrack}");
+        return $process;
+    }
+
+    /**
+     * Start video transcoding process (non-blocking)
+     */
+    protected function startVideoTranscoding(string $inputPath, string $outputDir, string $resolution, array $config): ?Process
+    {
+        $outputFile = $outputDir . '/' . $resolution . '.m3u8';
+        $tempSegmentPattern = $outputDir . '/temp_' . $resolution . '_%03d.ts';
+
+        // Generate encryption key and IV
+        $encryptionKey = $this->generateEncryptionKey($resolution);
+        $iv = $this->generateIV();
+        $keyFileName = $this->saveEncryptionKey($outputDir, $resolution, $encryptionKey);
+
+        // Store encryption info for later use
+        $this->encryptionKeys[$resolution] = [
+            'key' => $encryptionKey,
+            'iv' => $iv,
+            'key_file' => $keyFileName
+        ];
+
+        // Get optimized encoding parameters
+        $encodingParams = $this->getOptimizedEncodingParams();
+
+        $command = array_merge([
+            $this->ffmpegPath,
+            '-i', $inputPath,
+            '-an', // No audio
+        ], $encodingParams, [
+            '-b:v', $config['bitrate'],
+            '-vf', "scale={$config['width']}:{$config['height']}",
+            '-hls_time', (string) $this->performanceSettings['segment_time'],
+            '-hls_list_size', '0',
+            '-hls_segment_filename', $tempSegmentPattern,
+            // Encryption parameters
+            '-hls_key_info_file', $this->createKeyInfoFile($outputDir, $resolution, $keyFileName, $encryptionKey, $iv),
+            '-y',
+            $outputFile
+        ]);
+
+        $process = new Process($command);
+        $process->setTimeout(config('video.timeouts.process_timeout', 7200));
+        $process->start(); // Start asynchronously
+
+        Log::info("🎬 Started video transcoding: {$resolution} (HW: {$this->hwAccel})");
+        return $process;
     }
 
     protected function getVideoInfo(string $videoPath): array
@@ -315,7 +587,7 @@ class VideoProcessingService
     /**
      * Transcode audio-only stream to HLS with encryption
      */
-    protected function transcodeAudioToHLS(string $inputPath, string $outputDir, string $audioTrack, array $config): ?string
+    public function transcodeAudioToHLS(string $inputPath, string $outputDir, string $audioTrack, array $config): ?string
     {
         $outputFile = $outputDir . '/' . $audioTrack . '.m3u8';
         $tempSegmentPattern = $outputDir . '/temp_' . $audioTrack . '_%03d.ts';
@@ -338,7 +610,8 @@ class VideoProcessingService
             '-vn', // No video
             '-c:a', $config['codec'],
             '-b:a', $config['bitrate'],
-            '-hls_time', '10',
+            '-threads', (string) $this->performanceSettings['threads'],
+            '-hls_time', (string) $this->performanceSettings['segment_time'],
             '-hls_list_size', '0',
             '-hls_segment_filename', $tempSegmentPattern,
             // Encryption parameters
@@ -348,7 +621,7 @@ class VideoProcessingService
         ];
 
         $process = new Process($command);
-        $process->setTimeout(3600);
+        $process->setTimeout(config('video.timeouts.process_timeout', 7200));
         $process->run();
 
         if ($process->isSuccessful()) {
@@ -366,7 +639,7 @@ class VideoProcessingService
     /**
      * Transcode video-only stream to HLS with encryption
      */
-    protected function transcodeVideoToHLS(string $inputPath, string $outputDir, string $resolution, array $config): ?string
+    public function transcodeVideoToHLS(string $inputPath, string $outputDir, string $resolution, array $config): ?string
     {
         $outputFile = $outputDir . '/' . $resolution . '.m3u8';
         $tempSegmentPattern = $outputDir . '/temp_' . $resolution . '_%03d.ts';
@@ -383,24 +656,27 @@ class VideoProcessingService
             'key_file' => $keyFileName
         ];
 
-        $command = [
+        // Get optimized encoding parameters
+        $encodingParams = $this->getOptimizedEncodingParams();
+
+        $command = array_merge([
             $this->ffmpegPath,
             '-i', $inputPath,
             '-an', // No audio
-            '-c:v', 'libx264',
+        ], $encodingParams, [
             '-b:v', $config['bitrate'],
             '-vf', "scale={$config['width']}:{$config['height']}",
-            '-hls_time', '10',
+            '-hls_time', (string) $this->performanceSettings['segment_time'],
             '-hls_list_size', '0',
             '-hls_segment_filename', $tempSegmentPattern,
             // Encryption parameters
             '-hls_key_info_file', $this->createKeyInfoFile($outputDir, $resolution, $keyFileName, $encryptionKey, $iv),
             '-y',
             $outputFile
-        ];
+        ]);
 
         $process = new Process($command);
-        $process->setTimeout(3600);
+        $process->setTimeout(config('video.timeouts.process_timeout', 7200));
         $process->run();
 
         if ($process->isSuccessful()) {

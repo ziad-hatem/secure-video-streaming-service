@@ -10,11 +10,11 @@ class UserSubscription extends Model
     protected $fillable = [
         'user_id',
         'plan_id',
+        'stripe_subscription_id',
         'starts_at',
         'ends_at',
         'status',
         'usage_stats',
-        'stripe_subscription_id',
     ];
 
     protected $casts = [
@@ -44,9 +44,31 @@ class UserSubscription extends Model
     }
 
     /**
+     * Check if subscription has expired and update status if needed
+     */
+    public function checkAndUpdateExpiredStatus(): bool
+    {
+        if ($this->status === 'active' && $this->ends_at && $this->ends_at->isPast()) {
+            $this->update(['status' => 'expired']);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Check if subscription should be active but isn't started yet
+     */
+    public function shouldBeActive(): bool
+    {
+        return $this->status === 'active' &&
+               $this->starts_at->isPast() &&
+               ($this->ends_at === null || $this->ends_at->isFuture());
+    }
+
+    /**
      * Get current usage for a specific metric
      */
-    public function getCurrentUsage(string $metric): int
+    public function getCurrentUsage(string $metric): float
     {
         return $this->usage_stats[$metric] ?? 0;
     }
@@ -54,7 +76,7 @@ class UserSubscription extends Model
     /**
      * Increment usage for a specific metric
      */
-    public function incrementUsage(string $metric, int $amount = 1): void
+    public function incrementUsage(string $metric, float $amount = 1): void
     {
         $stats = $this->usage_stats ?? [];
         $stats[$metric] = ($stats[$metric] ?? 0) + $amount;

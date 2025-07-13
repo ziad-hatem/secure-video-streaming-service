@@ -62,24 +62,58 @@ class ApiKeyMiddleware
         }
 
         // Check subscription and usage limits
-        $user = $apiKey->user;
-        if (!$user->isOnTrial() && !$user->hasActiveSubscription()) {
+        $user = $apiKey->user->fresh(); // Get fresh user data from database
+        $user->unsetRelation('activeSubscription'); // Clear cached relationship
+
+        // Define endpoints that don't require active subscription
+        $allowedWithoutSubscription = [
+            'user',
+            'subscription/plans',
+            'subscription/current',
+            'subscription/subscribe',
+            'subscription/checkout-success',
+            'subscription/stripe-config',
+            'api-keys',
+            'auth/logout'
+        ];
+
+        $currentPath = $request->path();
+        $requiresSubscription = true;
+
+        foreach ($allowedWithoutSubscription as $allowedPath) {
+            if (str_contains($currentPath, $allowedPath)) {
+                $requiresSubscription = false;
+                break;
+            }
+        }
+
+        if ($requiresSubscription && !$user->isOnTrial() && !$user->hasActiveSubscription()) {
+            // Debug: Check what's happening
+            $activeSub = $user->activeSubscription;
+            \Log::info('Subscription check failed', [
+                'user_id' => $user->id,
+                'is_on_trial' => $user->isOnTrial(),
+                'has_active_subscription' => $user->hasActiveSubscription(),
+                'active_subscription_id' => $activeSub ? $activeSub->id : null,
+                'path' => $request->path(),
+            ]);
+
             return response()->json([
                 'error' => 'No active subscription',
                 'message' => 'Please subscribe to a plan to continue using the API'
             ], 402); // Payment Required
         }
 
-        // Check API call limits
-        if ($user->hasExceededUsageLimit('api_calls_per_month')) {
+        // Check API call limits (only for users with active subscriptions)
+        if ($user->hasActiveSubscription() && $user->hasExceededUsageLimit('api_calls_per_month')) {
             return response()->json([
                 'error' => 'Usage limit exceeded',
                 'message' => 'You have exceeded your monthly API call limit'
             ], 429); // Too Many Requests
         }
 
-        // Check data transfer limits
-        if ($user->hasExceededUsageLimit('data_transfer_gb')) {
+        // Check data transfer limits (only for users with active subscriptions)
+        if ($user->hasActiveSubscription() && $user->hasExceededUsageLimit('data_transfer_gb')) {
             return response()->json([
                 'error' => 'Data transfer limit exceeded',
                 'message' => 'You have exceeded your monthly data transfer limit'
@@ -117,10 +151,13 @@ class ApiKeyMiddleware
         if ($user->activeSubscription) {
             $user->activeSubscription->incrementUsage('api_calls_per_month');
 
-            // Track data transfer for streaming endpoints
-            $responseSize = strlen($response->getContent());
-            if ($responseSize > 0) {
-                $user->activeSubscription->incrementUsage('data_transfer_gb', $responseSize);
+            // Track data transfer for API responses (but not for HLS chunks - those are tracked separately)
+            if (!$request->is('hls/*')) {
+                $responseSize = strlen($response->getContent());
+                if ($responseSize > 0) {
+                    $responseSizeGB = $responseSize / (1024 * 1024 * 1024); // Convert bytes to GB
+                    $user->activeSubscription->incrementUsage('data_transfer_gb', $responseSizeGB);
+                }
             }
         }
 

@@ -25,15 +25,18 @@ class ProcessVideoJob implements ShouldQueue
     /**
      * The maximum number of seconds the job can run.
      */
-    public int $timeout = 3600; // 1 hour
+    public int $timeout;
 
     /**
-     * Create a new job instance.
+     * Initialize timeout from configuration
      */
     public function __construct(Video $video)
     {
         $this->video = $video;
+        $this->timeout = config('video.timeouts.job_timeout', 10800); // 3 hours default
     }
+
+
 
     /**
      * Execute the job.

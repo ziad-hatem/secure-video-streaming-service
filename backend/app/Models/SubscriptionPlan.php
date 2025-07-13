@@ -16,6 +16,8 @@ class SubscriptionPlan extends Model
         'limits',
         'is_active',
         'sort_order',
+        'stripe_product_id',
+        'stripe_price_id',
     ];
 
     protected $casts = [
@@ -23,6 +25,10 @@ class SubscriptionPlan extends Model
         'features' => 'array',
         'limits' => 'array',
         'is_active' => 'boolean',
+    ];
+
+    protected $appends = [
+        'formatted_price',
     ];
 
     public function userSubscriptions(): HasMany

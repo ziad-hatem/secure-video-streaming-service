@@ -97,7 +97,10 @@ class AuthController extends Controller
         // Revoke all existing tokens
         $user->tokens()->delete();
 
-        // Create or get dashboard API key
+        // Create Sanctum token for web dashboard authentication
+        $token = $user->createToken('dashboard-access')->plainTextToken;
+
+        // Also create or get dashboard API key for API access
         $dashboardApiKey = $user->apiKeys()->where('name', 'Dashboard Access')->first();
 
         if (!$dashboardApiKey) {
@@ -117,15 +120,14 @@ class AuthController extends Controller
             ]);
         }
 
-        $token = $dashboardApiKey->key;
-
         // Load subscription data
         $user->load('activeSubscription.plan');
 
         return response()->json([
             'message' => 'Login successful',
             'user' => $user,
-            'token' => $token,
+            'token' => $token, // Sanctum token for web dashboard
+            'api_key' => $dashboardApiKey->key, // API key for API access
             'subscription' => $user->activeSubscription ? [
                 'id' => $user->activeSubscription->id,
                 'plan' => $user->activeSubscription->plan,
@@ -142,16 +144,14 @@ class AuthController extends Controller
      */
     public function logout(Request $request): JsonResponse
     {
-        // Get the API key from the request
-        $apiKey = $request->attributes->get('api_key');
+        // Revoke the current Sanctum token
+        $request->user()->currentAccessToken()->delete();
 
-        if ($apiKey) {
-            // Deactivate the dashboard API key
-            $apiKey->update(['is_active' => false]);
+        // Also deactivate the dashboard API key if it exists
+        $dashboardApiKey = $request->user()->apiKeys()->where('name', 'Dashboard Access')->first();
+        if ($dashboardApiKey) {
+            $dashboardApiKey->update(['is_active' => false]);
         }
-
-        // Also revoke Sanctum tokens if any exist
-        $request->user()->tokens()->delete();
 
         return response()->json([
             'message' => 'Logged out successfully'

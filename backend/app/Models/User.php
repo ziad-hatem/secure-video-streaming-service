@@ -29,6 +29,7 @@ class User extends Authenticatable
         'billing_email',
         'trial_ends_at',
         'is_active',
+        'stripe_customer_id',
     ];
 
     /**
@@ -68,7 +69,9 @@ class User extends Authenticatable
 
     public function activeSubscription(): HasOne
     {
-        return $this->hasOne(UserSubscription::class)->active();
+        return $this->hasOne(UserSubscription::class)
+            ->where('status', 'active')
+            ->latest('starts_at'); // Get the most recent active subscription
     }
 
     public function videos(): HasMany
@@ -81,7 +84,12 @@ class User extends Authenticatable
      */
     public function hasActiveSubscription(): bool
     {
-        return $this->activeSubscription()->exists();
+        // Load the relationship if not already loaded
+        if (!$this->relationLoaded('activeSubscription')) {
+            $this->load('activeSubscription');
+        }
+        
+        return $this->activeSubscription !== null;
     }
 
     /**
@@ -89,6 +97,11 @@ class User extends Authenticatable
      */
     public function getCurrentPlan(): ?SubscriptionPlan
     {
+        // Load the relationship with plan if not already loaded
+        if (!$this->relationLoaded('activeSubscription')) {
+            $this->load('activeSubscription.plan');
+        }
+        
         return $this->activeSubscription?->plan;
     }
 
@@ -118,6 +131,10 @@ class User extends Authenticatable
      */
     public function hasExceededUsageLimit(string $metric): bool
     {
+        if (!$this->relationLoaded('activeSubscription')) {
+            $this->load('activeSubscription');
+        }
+        
         $subscription = $this->activeSubscription;
         return $subscription && $subscription->isUsageLimitExceeded($metric);
     }
